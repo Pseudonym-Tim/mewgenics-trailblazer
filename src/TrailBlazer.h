@@ -23,6 +23,7 @@
 #define MOVE_ABILITY_RAW_HOVER_TILE_OFFSET 0x628 // MoveAbility -> raw hover tile before vanilla target sanitization...
 #define CHARACTER_TILE_OWNER_OFFSET 0x60 // Character -> tile owner / tile component pointer...
 #define CHARACTER_TILE_PACKED_OFFSET 0x48 // Tile owner/component -> packed uint64 tile coordinate...
+#define CHARACTER_TILE_SIZE_OFFSET 0x138 // Tile owner/component -> footprint size code (1 is the supported 1x1 footprint)...
 #define CHARACTER_PENDING_ABILITY_OFFSET 0x118 // Character -> pending Ability* used during release-trigger validation...
 #define CHARACTER_PENDING_TURN_ACTION_OFFSET 0x120 // Character -> pending TurnAction* passed to Ability::Trigger...
 
@@ -33,11 +34,14 @@
 #define PREPARED_PATH_WINDOW_MS 5000ULL
 #define APPLY_PATH_OVERRIDE_WINDOW_MS 350ULL
 #define APPLY_PATH_OVERRIDE_BUDGET 64
+#define CANCEL_MOVE_TRIGGER_WINDOW_MS 500ULL
 #define RELEASE_PREVIEW_STALE_MS 50ULL
 #define RELEASE_CURSOR_DRIFT_PIXELS 8L
 #define AUTO_MOVE_ON_RELEASE 1
 #define MANUAL_DRAG_ARM_PIXELS 10L
 #define MANUAL_DRAG_ARM_MIN_HELD_MS 35ULL
+#define ORIGIN_DRAG_BEGIN_STRONG_RADIUS_PIXELS 12L
+#define ORIGIN_DRAG_BEGIN_BOOTSTRAP_RADIUS_PIXELS 24L
 
 #define ENABLE_OPPOSITE_DIAGONAL_CORNER_BRIDGE 1
 #define REQUIRE_FRESH_PREVIEW_ON_RELEASE 1

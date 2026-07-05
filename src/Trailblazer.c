@@ -38,6 +38,8 @@ static int32_t g_dragCount = 0;
 static uint64_t g_dragStartTile = 0;
 static uint64_t g_dragEndTile = 0;
 static void* g_dragAbility = NULL;
+static ULONGLONG g_originHoverConfirmedTick = 0;
+static POINT g_originHoverConfirmedCursor = { 0, 0 };
 
 // Last validated manual path prepared for preview/execution override after mouse release...
 static uint64_t g_preparedTiles[MAX_MANUAL_PATH_TILES];
@@ -57,10 +59,13 @@ static uint8_t g_wasLeftDown = 0;
 static uint8_t g_pendingPreviewRelease = 0;
 static uint8_t g_manualDragArmed = 0;
 static POINT g_dragBeginCursor = { 0, 0 };
+static uint8_t g_hasDragBeginCursor = 0;
 static ULONGLONG g_dragBeginTick = 0;
 static volatile LONG g_applyNextPath = 0;
 static volatile LONG g_applyOverrideBudget = 0;
 static ULONGLONG g_applyOverrideUntilTick = 0;
+static void* g_cancelMoveAbility = NULL;
+static ULONGLONG g_cancelMoveUntilTick = 0;
 static volatile LONG g_autoTriggerBusy = 0;
 static volatile LONG g_autoMoveOnRelease = AUTO_MOVE_ON_RELEASE;
 static void* g_lastPreviewAbility = NULL;
@@ -69,6 +74,7 @@ static uint64_t g_lastPreviewTargetTile = 0;
 static int32_t g_lastPreviewWasReachable = 0;
 static int32_t g_rawHoverDifferentCount = 0;
 static int32_t g_executionApplyCount = 0;
+static void* g_lastIgnoredManualDragAbility = NULL;
 
 // Screen-to-tile calibration samples learned from vanilla preview targets under the cursor...
 typedef struct TileScreenCalibrationSample
@@ -103,6 +109,8 @@ typedef struct FrameDragCandidate
 
 #define FRAME_DRAG_CANDIDATE_COUNT 32
 #define FRAME_DRAG_CANDIDATE_MAX_AGE_MS 250ULL
+#define ORIGIN_HOVER_CONFIRM_WINDOW_MS 2000ULL
+#define ORIGIN_HOVER_CONFIRM_CURSOR_DRIFT_PIXELS 12L
 
 static FrameDragCandidate g_frameDragCandidates[FRAME_DRAG_CANDIDATE_COUNT];
 static int32_t g_frameDragCandidateCount = 0;
@@ -110,6 +118,10 @@ static int32_t g_frameDragCandidateWriteIndex = 0;
 
 // Checks whether native path buffer reached requested target tile...
 static int IsPathBufferEndingAtTile(ManualPathBuffer* path, uint64_t targetTile);
+static LONG AbsLong(LONG value);
+static int IsCursorNearDragBeginNoLock(POINT cursor, LONG radiusPixels);
+static int AppendDragTileDirectNoLock(void* ability, uint64_t tile);
+static int ReturnDragToOriginIfCurrentlyHoveredNoLock(void* ability, uint64_t previewTargetTile, const char* sourceName);
 
 static void Log(const char* fmt, ...)
 {
@@ -1085,6 +1097,12 @@ static int IsInferredTransitTileAllowedNoLock(void* ability, uint64_t candidateT
         return 1;
     }
 
+    // The occupied origin is not a legal native transit tile, but hovering it means "cancel"...
+    if (g_dragStartTile != 0 && candidateTile == g_dragStartTile)
+    {
+        return 1;
+    }
+
     if (g_dragCount <= 0)
     {
         return 1;
@@ -1134,6 +1152,39 @@ static int AddInferredDragTile(void* ability, uint64_t tile, uint64_t previewTar
 
     AddDragTile(ability, tile);
     return 1;
+}
+
+// Returns true when a low-confidence candidate would rewind an already-authored path...
+static int IsEarlierDragTileNoLock(uint64_t tile)
+{
+    int32_t index;
+
+    if (tile == 0 || g_dragCount <= 1)
+    {
+        return 0;
+    }
+
+    for (index = 0; index < (g_dragCount - 1); index++)
+    {
+        if (g_dragTiles[index] == tile)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// Cursor-derived candidates are supplemental transit hints and must never pull the endpoint backward...
+static int AddSupplementalInferredDragTile(void* ability, uint64_t tile, uint64_t previewTargetTile, const char* sourceName)
+{
+    if (IsEarlierDragTileNoLock(tile))
+    {
+        Log("Ignored stale supplemental %s tile that would rewind the drag: tile=(%d,%d) end=(%d,%d)", sourceName ? sourceName : "cursor", TileX(tile), TileY(tile), TileX(g_dragEndTile), TileY(g_dragEndTile));
+        return 0;
+    }
+
+    return AddInferredDragTile(ability, tile, previewTargetTile, sourceName);
 }
 
 // Queues timer-discovered candidate so it can be consumed by the next preview hook call...
@@ -1232,7 +1283,7 @@ static void DrainFrameDragCandidatesNoLock(void* ability, uint64_t previewTarget
     for (index = 0; index < orderedCount; index++)
     {
         validationPreviewTargetTile = previewTargetTile != 0 ? previewTargetTile : orderedCandidates[index].previewTargetTile;
-        AddInferredDragTile(ability, orderedCandidates[index].tile, validationPreviewTargetTile, orderedCandidates[index].sourceName);
+        AddSupplementalInferredDragTile(ability, orderedCandidates[index].tile, validationPreviewTargetTile, orderedCandidates[index].sourceName);
     }
 }
 
@@ -1251,6 +1302,29 @@ static int TryReadU64(void* base, UINT_PTR offset, uint64_t* outValue)
     __try
     {
         *outValue = *(uint64_t*)(bytes + offset);
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return 0;
+    }
+}
+
+// Safely reads a signed 32-bit field from a native object...
+static int TryReadI32(void* base, UINT_PTR offset, int32_t* outValue)
+{
+    uint8_t* bytes;
+
+    if (!base || !outValue)
+    {
+        return 0;
+    }
+
+    bytes = (uint8_t*)base;
+
+    __try
+    {
+        *outValue = *(int32_t*)(bytes + offset);
         return 1;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -1322,6 +1396,62 @@ static int TryGetCharacterTile(void* character, uint64_t* outTile)
     }
 
     return TryReadU64(tileOwner, CHARACTER_TILE_PACKED_OFFSET, outTile);
+}
+
+// Reads the tile-owner footprint code used by the game (1 means a 1x1 character)...
+static int TryGetCharacterTileSize(void* character, int32_t* outSize)
+{
+    void* tileOwner;
+
+    if (!TryReadPointer(character, CHARACTER_TILE_OWNER_OFFSET, &tileOwner))
+    {
+        return 0;
+    }
+
+    return TryReadI32(tileOwner, CHARACTER_TILE_SIZE_OFFSET, outSize);
+}
+
+// Manual paths are intentionally limited to characters occupying exactly one tile...
+static int IsCharacterSingleTile(void* character, int32_t* outSize)
+{
+    int32_t size;
+
+    size = 0;
+
+    if (!TryGetCharacterTileSize(character, &size))
+    {
+        if (outSize)
+        {
+            *outSize = 0;
+        }
+
+        return 0;
+    }
+
+    if (outSize)
+    {
+        *outSize = size;
+    }
+
+    return (size == 1) ? 1 : 0;
+}
+
+// Resolves the ability owner before applying the 1x1-only manual-path rule...
+static int IsAbilityCharacterSingleTile(void* ability, int32_t* outSize)
+{
+    void* character;
+
+    if (!TryGetAbilityCharacter(ability, &character))
+    {
+        if (outSize)
+        {
+            *outSize = 0;
+        }
+
+        return 0;
+    }
+
+    return IsCharacterSingleTile(character, outSize);
 }
 
 // Extracts the current start tile and sanitized target tile from a MoveAbility...
@@ -1440,6 +1570,103 @@ static int TryGetAbilityRawHoverTile(void* ability, uint64_t previewTargetTile, 
     return 0;
 }
 
+// Rechecks the live raw/cursor hover and immediately truncates the authored path to its origin...
+// (This closes release/trigger races where vanilla has already sanitized the selected tile to an adjacent move)...
+static int ReturnDragToOriginIfCurrentlyHoveredNoLock(void* ability, uint64_t previewTargetTile, const char* sourceName)
+{
+    uint64_t rawHoverTile;
+    uint64_t inferredHoverTile;
+    ULONGLONG nowTick;
+    POINT cursor;
+    LONG cursorDeltaX;
+    LONG cursorDeltaY;
+    int hasRawHoverTile;
+    int hasInferredHoverTile;
+    int anchoredOriginHover;
+    int liveOriginHover;
+    int recentOriginHover;
+
+    if (!ability || g_dragStartTile == 0 || g_dragCount <= 0)
+    {
+        return 0;
+    }
+
+    rawHoverTile = 0;
+    inferredHoverTile = 0;
+    hasRawHoverTile = TryGetAbilityRawHoverTile(ability, previewTargetTile, &rawHoverTile);
+    hasInferredHoverTile = TryInferCursorTileNoLock(&inferredHoverTile);
+    recentOriginHover = 0;
+    anchoredOriginHover = 0;
+    cursor.x = 0;
+    cursor.y = 0;
+
+    if (GetCursorPos(&cursor) && g_hasDragBeginCursor)
+    {
+        // The mouse-down point is a calibration-free proof that the cursor began on the occupied tile.
+        // Use a tight anchor even when calibration exists, and a slightly wider bootstrap anchor 
+        // only while cursor-to-tile inference is unavailable...
+        if (IsCursorNearDragBeginNoLock(cursor, ORIGIN_DRAG_BEGIN_STRONG_RADIUS_PIXELS) || (!hasInferredHoverTile && IsCursorNearDragBeginNoLock(cursor, ORIGIN_DRAG_BEGIN_BOOTSTRAP_RADIUS_PIXELS)))
+        {
+            anchoredOriginHover = 1;
+        }
+    }
+
+    liveOriginHover = (previewTargetTile == g_dragStartTile || (hasRawHoverTile && rawHoverTile == g_dragStartTile) || (hasInferredHoverTile && inferredHoverTile == g_dragStartTile) || anchoredOriginHover);
+
+    if (liveOriginHover)
+    {
+        g_originHoverConfirmedTick = GetTickCount64();
+        g_originHoverConfirmedCursor = cursor;
+
+        // Never teach the calibration that vanilla's sanitized adjacent target was under
+        // the cursor when the cursor is actually back on the occupied origin tile...
+        RememberTileScreenSampleNoLock(g_dragStartTile);
+    }
+    else if (g_originHoverConfirmedTick != 0 && g_dragEndTile == g_dragStartTile)
+    {
+        nowTick = GetTickCount64();
+        cursorDeltaX = AbsLong(cursor.x - g_originHoverConfirmedCursor.x);
+        cursorDeltaY = AbsLong(cursor.y - g_originHoverConfirmedCursor.y);
+
+        if ((nowTick - g_originHoverConfirmedTick) <= ORIGIN_HOVER_CONFIRM_WINDOW_MS &&
+            cursorDeltaX <= ORIGIN_HOVER_CONFIRM_CURSOR_DRIFT_PIXELS &&
+            cursorDeltaY <= ORIGIN_HOVER_CONFIRM_CURSOR_DRIFT_PIXELS)
+        {
+            recentOriginHover = 1;
+        }
+        else
+        {
+            g_originHoverConfirmedTick = 0;
+            g_originHoverConfirmedCursor.x = 0;
+            g_originHoverConfirmedCursor.y = 0;
+        }
+    }
+
+    if (!liveOriginHover && !recentOriginHover)
+    {
+        return 0;
+    }
+
+    if (!AppendDragTileDirectNoLock(ability, g_dragStartTile))
+    {
+        Log("Failed to truncate manual drag to hovered origin: source=%s start=(%d,%d)", sourceName ? sourceName : "origin-refresh", TileX(g_dragStartTile), TileY(g_dragStartTile));
+        return 0;
+    }
+
+    ClearFrameDragCandidatesNoLock();
+
+    if (liveOriginHover)
+    {
+        Log("Manual drag live origin hover confirmed: source=%s start=(%d,%d) preview=(%d,%d) raw=(%d,%d) inferred=(%d,%d) anchored=%d calibrated=%d", sourceName ? sourceName : "origin-refresh", TileX(g_dragStartTile), TileY(g_dragStartTile), TileX(previewTargetTile), TileY(previewTargetTile), TileX(rawHoverTile), TileY(rawHoverTile), TileX(inferredHoverTile), TileY(inferredHoverTile), anchoredOriginHover, g_tileScreenCalibrationReady);
+    }
+    else
+    {
+        Log("Manual drag preserved recent origin hover through sanitized release: source=%s start=(%d,%d)", sourceName ? sourceName : "origin-refresh", TileX(g_dragStartTile), TileY(g_dragStartTile));
+    }
+
+    return 1;
+}
+
 // Resets all in-progress drag state after release, rejection, or shutdown...
 static void ClearDragPath(void)
 {
@@ -1447,6 +1674,7 @@ static void ClearDragPath(void)
     g_manualDragArmed = 0;
     g_dragBeginCursor.x = 0;
     g_dragBeginCursor.y = 0;
+    g_hasDragBeginCursor = 0;
     g_dragBeginTick = 0;
     g_lastDragPreviewTick = 0;
     g_lastDragPreviewTargetTile = 0;
@@ -1460,6 +1688,9 @@ static void ClearDragPath(void)
     g_dragStartTile = 0;
     g_dragEndTile = 0;
     g_dragAbility = NULL;
+    g_originHoverConfirmedTick = 0;
+    g_originHoverConfirmedCursor.x = 0;
+    g_originHoverConfirmedCursor.y = 0;
 }
 
 // Records the latest preview target/cursor used for fresh-release validation...
@@ -1489,6 +1720,25 @@ static LONG AbsLong(LONG value)
     return (value < 0) ? -value : value;
 }
 
+// Tests the current cursor against the true occupied-tile point captured on mouse-down...
+static int IsCursorNearDragBeginNoLock(POINT cursor, LONG radiusPixels)
+{
+    int64_t deltaX;
+    int64_t deltaY;
+    int64_t radius;
+
+    if (!g_hasDragBeginCursor || radiusPixels <= 0)
+    {
+        return 0;
+    }
+
+    deltaX = (int64_t)cursor.x - (int64_t)g_dragBeginCursor.x;
+    deltaY = (int64_t)cursor.y - (int64_t)g_dragBeginCursor.y;
+    radius = (int64_t)radiusPixels;
+
+    return ((deltaX * deltaX) + (deltaY * deltaY)) <= (radius * radius);
+}
+
 // Clears the post-release prepared path and disarms execution override state...
 static void ClearPreparedPathNoLock(const char* reason)
 {
@@ -1499,13 +1749,63 @@ static void ClearPreparedPathNoLock(const char* reason)
     DisarmPreparedPathOverrideNoLock(reason);
 }
 
+// Clears a pending one-shot cancellation for a drag released on its origin tile...
+static void ClearMoveCancellationNoLock(void)
+{
+    g_cancelMoveAbility = NULL;
+    g_cancelMoveUntilTick = 0;
+}
+
+// Suppresses the next MoveAbility::OnTrigger generated by releasing a cancelled manual drag...
+static void ArmMoveCancellationNoLock(void* ability, const char* reason)
+{
+    if (!ability)
+    {
+        ClearMoveCancellationNoLock();
+        return;
+    }
+
+    g_cancelMoveAbility = ability;
+    g_cancelMoveUntilTick = GetTickCount64() + CANCEL_MOVE_TRIGGER_WINDOW_MS;
+    Log("Armed manual move cancellation: reason=%s ability=%p", reason ? reason : "returned to start", ability);
+}
+
+// Consumes a fresh cancellation only for the ability that authored the cancelled drag...
+static int ConsumeMoveCancellationNoLock(void* ability)
+{
+    ULONGLONG nowTick;
+
+    if (!g_cancelMoveAbility)
+    {
+        return 0;
+    }
+
+    nowTick = GetTickCount64();
+
+    if (nowTick > g_cancelMoveUntilTick)
+    {
+        Log("Expired manual move cancellation for ability=%p", g_cancelMoveAbility);
+        ClearMoveCancellationNoLock();
+        return 0;
+    }
+
+    if (g_cancelMoveAbility != ability)
+    {
+        return 0;
+    }
+
+    Log("Consumed manual move cancellation for ability=%p", ability);
+    ClearMoveCancellationNoLock();
+    return 1;
+}
+
 // Starts the drag arming window when left mouse is pressed...
 static void BeginManualDragCandidateNoLock(void)
 {
     g_manualDragArmed = 0;
     g_dragBeginCursor.x = 0;
     g_dragBeginCursor.y = 0;
-    GetCursorPos(&g_dragBeginCursor);
+    g_hasDragBeginCursor = GetCursorPos(&g_dragBeginCursor) ? 1 : 0;
     g_dragBeginTick = GetTickCount64();
 }
 
@@ -2256,6 +2556,7 @@ static void TriggerPreparedMoveNoLock(void)
 static void PrepareDragPathNoLock(void)
 {
     int32_t index;
+    int32_t characterSize;
 
     g_preparedCount = 0;
     g_preparedStartTile = 0;
@@ -2265,6 +2566,26 @@ static void PrepareDragPathNoLock(void)
     if (!g_manualDragArmed)
     {
         Log("Drag end ignored: click/no manual drag intent count=%d", g_dragCount);
+        return;
+    }
+
+    characterSize = 0;
+
+    if (!IsAbilityCharacterSingleTile(g_dragAbility, &characterSize))
+    {
+        Log("Drag end ignored for non-1x1 character: sizeCode=%d ability=%p", characterSize, g_dragAbility);
+        DisarmPreparedPathOverrideNoLock("non-1x1 character");
+        return;
+    }
+
+    // Refresh the actual cursor/raw hover at release, (because the final preview callback may not run)...
+    ReturnDragToOriginIfCurrentlyHoveredNoLock(g_dragAbility, g_lastDragPreviewTargetTile, "release-prepare");
+
+    if (g_dragStartTile != 0 && g_dragEndTile == g_dragStartTile)
+    {
+        ArmMoveCancellationNoLock(g_dragAbility, "manual drag released on origin tile");
+        DisarmPreparedPathOverrideNoLock("manual drag returned to origin");
+        Log("Drag end cancelled at origin: start=(%d,%d)", TileX(g_dragStartTile), TileY(g_dragStartTile));
         return;
     }
 
@@ -2561,7 +2882,27 @@ static void OverwriteExecutionPathBufferFromTiles(ManualPathBuffer* outPath, con
     }
 }
 
-// Samples raw hover, inferred cursor tile, queued candidates, and sanitized preview target in safe priority order...
+// Hides the vanilla preview while an armed manual drag is back on its origin tile...
+static void ClearPathBufferNoLock(ManualPathBuffer* path, const char* reason)
+{
+    if (!path)
+    {
+        return;
+    }
+
+    __try
+    {
+        path->count = 0;
+        Log("Cleared path buffer: reason=%s", reason ? reason : "manual cancellation");
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Log("Exception while clearing path buffer: reason=%s", reason ? reason : "manual cancellation");
+    }
+}
+
+// Keeps the manual endpoint synchronized with the native preview target while using projections only as transit hints...
+// The occupied origin is the sole exception because native targeting sanitizes it to an adjacent legal move tile.
 static void AddDragSampleTiles(void* ability, uint64_t previewTargetTile)
 {
     uint64_t rawHoverTile;
@@ -2570,40 +2911,35 @@ static void AddDragSampleTiles(void* ability, uint64_t previewTargetTile)
     uint64_t lastTile;
     int hasRawHoverTile;
     int hasInferredHoverTile;
-    int32_t candidateStartCount;
-    int32_t candidateEndCount;
-    int32_t lastDistanceToPreview;
-    int manualCandidateDifferedFromPreview;
+
+    // Resolve the occupied origin before recording the native target. Vanilla can sanitize an
+    // origin hover to an adjacent legal destination, which could poison calibration...
+    if (ReturnDragToOriginIfCurrentlyHoveredNoLock(ability, previewTargetTile, "preview-sample"))
+    {
+        return;
+    }
 
     RememberTileScreenSampleNoLock(previewTargetTile);
-    DrainFrameDragCandidatesNoLock(ability, previewTargetTile);
-
-    candidateStartCount = g_dragCount;
-    manualCandidateDifferedFromPreview = 0;
 
     rawHoverTile = 0;
     hasRawHoverTile = TryGetAbilityRawHoverTile(ability, previewTargetTile, &rawHoverTile);
-
-    if (hasRawHoverTile && rawHoverTile != 0)
-    {
-        if (rawHoverTile != previewTargetTile)
-        {
-            manualCandidateDifferedFromPreview = 1;
-            g_rawHoverDifferentCount++;
-            Log("Raw hover candidate differs from preview: raw=(%d,%d) preview=(%d,%d) count=%d", TileX(rawHoverTile), TileY(rawHoverTile), TileX(previewTargetTile), TileY(previewTargetTile), g_rawHoverDifferentCount);
-            AddInferredDragTile(ability, rawHoverTile, previewTargetTile, "raw-hover");
-        }
-    }
-
     inferredHoverTile = 0;
     hasInferredHoverTile = TryInferCursorTileNoLock(&inferredHoverTile);
 
+    DrainFrameDragCandidatesNoLock(ability, previewTargetTile);
+
+    if (hasRawHoverTile && rawHoverTile != 0 && rawHoverTile != previewTargetTile)
+    {
+        g_rawHoverDifferentCount++;
+        Log("Raw hover transit differs from preview: raw=(%d,%d) preview=(%d,%d) count=%d", TileX(rawHoverTile), TileY(rawHoverTile), TileX(previewTargetTile), TileY(previewTargetTile), g_rawHoverDifferentCount);
+        AddSupplementalInferredDragTile(ability, rawHoverTile, previewTargetTile, "raw-hover");
+    }
+
     if (hasInferredHoverTile && inferredHoverTile != 0 && inferredHoverTile != previewTargetTile)
     {
-        manualCandidateDifferedFromPreview = 1;
         g_inferredHoverDifferentCount++;
-        Log("Inferred cursor tile differs from preview: inferred=(%d,%d) preview=(%d,%d) count=%d", TileX(inferredHoverTile), TileY(inferredHoverTile), TileX(previewTargetTile), TileY(previewTargetTile), g_inferredHoverDifferentCount);
-        AddInferredDragTile(ability, inferredHoverTile, previewTargetTile, "cursor-projected");
+        Log("Inferred cursor transit differs from preview: inferred=(%d,%d) preview=(%d,%d) count=%d", TileX(inferredHoverTile), TileY(inferredHoverTile), TileX(previewTargetTile), TileY(previewTargetTile), g_inferredHoverDifferentCount);
+        AddSupplementalInferredDragTile(ability, inferredHoverTile, previewTargetTile, "cursor-projected");
     }
 
     if (g_dragCount > 0)
@@ -2613,23 +2949,13 @@ static void AddDragSampleTiles(void* ability, uint64_t previewTargetTile)
 
         if (projectedCornerTile != 0 && projectedCornerTile != lastTile && projectedCornerTile != previewTargetTile)
         {
-            manualCandidateDifferedFromPreview = 1;
-            Log("Projected diagonal corner candidate: last=(%d,%d) corner=(%d,%d) preview=(%d,%d)", TileX(lastTile), TileY(lastTile), TileX(projectedCornerTile), TileY(projectedCornerTile), TileX(previewTargetTile), TileY(previewTargetTile));
-            AddInferredDragTile(ability, projectedCornerTile, previewTargetTile, "diagonal-corner");
+            Log("Projected diagonal corner transit: last=(%d,%d) corner=(%d,%d) preview=(%d,%d)", TileX(lastTile), TileY(lastTile), TileX(projectedCornerTile), TileY(projectedCornerTile), TileX(previewTargetTile), TileY(previewTargetTile));
+            AddSupplementalInferredDragTile(ability, projectedCornerTile, previewTargetTile, "diagonal-corner");
         }
     }
 
-    candidateEndCount = g_dragCount;
-
-    if (manualCandidateDifferedFromPreview && candidateEndCount == candidateStartCount && g_dragCount > 0 && previewTargetTile != 0)
-    {
-        lastTile = g_dragTiles[g_dragCount - 1];
-        lastDistanceToPreview = AbsI32(TileX(lastTile) - TileX(previewTargetTile)) + AbsI32(TileY(lastTile) - TileY(previewTargetTile));
-
-        Log("Suppressed sanitized preview fallback because cursor/manual candidate disagreed and was not accepted: last=(%d,%d) preview=(%d,%d) dist=%d", TileX(lastTile), TileY(lastTile), TileX(previewTargetTile), TileY(previewTargetTile), lastDistanceToPreview);
-        return;
-    }
-
+    // (The target passed to the native preview builder is the selected tile used at release)
+    // Always settle the manual endpoint on it so the drawn path and release validation agree...
     AddDragTile(ability, previewTargetTile);
 }
 
@@ -2642,6 +2968,11 @@ static void AddFrameCursorDragSampleNoLock(void* ability, uint64_t previewTarget
     int hasInferredHoverTile;
 
     if (!ability || previewTargetTile == 0 || g_dragCount <= 0)
+    {
+        return;
+    }
+
+    if (ReturnDragToOriginIfCurrentlyHoveredNoLock(ability, previewTargetTile, "frame-sampler"))
     {
         return;
     }
@@ -2671,6 +3002,8 @@ static void SampleDragFromPathArgs(void* ability, uint64_t startTile, uint64_t t
 {
     ULONGLONG nowTick;
     uint8_t isLeftDown;
+    int32_t characterSize;
+    int allowManualDrag;
 
     if (InterlockedCompareExchange(&g_pathLockReady, 0, 0) == 0)
     {
@@ -2686,8 +3019,40 @@ static void SampleDragFromPathArgs(void* ability, uint64_t startTile, uint64_t t
 
     g_lastSampleTick = nowTick;
     isLeftDown = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) ? 1 : 0;
+    characterSize = 0;
+    allowManualDrag = IsAbilityCharacterSingleTile(ability, &characterSize);
 
     EnterCriticalSection(&g_pathLock);
+
+    if (!allowManualDrag)
+    {
+        // Do not let unrelated background previews disturb an active 1x1 drag...
+        if (g_dragAbility && g_dragAbility != ability && g_wasLeftDown)
+        {
+            LeaveCriticalSection(&g_pathLock);
+            return;
+        }
+
+        if (g_lastIgnoredManualDragAbility != ability)
+        {
+            Log("Manual drag ignored for non-1x1 character: sizeCode=%d ability=%p", characterSize, ability);
+            g_lastIgnoredManualDragAbility = ability;
+        }
+
+        if (isLeftDown && !g_wasLeftDown)
+        {
+            ClearPreparedPathNoLock("non-1x1 mouse down");
+            ClearMoveCancellationNoLock();
+        }
+
+        ClearDragPath();
+        ClearFrameDragCandidatesNoLock();
+        g_wasLeftDown = isLeftDown;
+        LeaveCriticalSection(&g_pathLock);
+        return;
+    }
+
+    g_lastIgnoredManualDragAbility = NULL;
 
     if (isLeftDown)
     {
@@ -2699,6 +3064,7 @@ static void SampleDragFromPathArgs(void* ability, uint64_t startTile, uint64_t t
         ClearDragPath();
         ClearFrameDragCandidatesNoLock();
         ClearPreparedPathNoLock("new mouse down before manual intent");
+        ClearMoveCancellationNoLock();
         BeginManualDragCandidateNoLock();
         TouchDragPreviewNoLock(targetTile);
         g_dragAbility = ability;
@@ -2738,7 +3104,7 @@ static void SampleDragFromPathArgs(void* ability, uint64_t startTile, uint64_t t
         TouchDragPreviewNoLock(targetTile);
         AddDragSampleTiles(ability, targetTile);
 
-        if (UpdateManualDragArmNoLock("drag-release") && g_dragCount >= 2)
+        if (UpdateManualDragArmNoLock("drag-release") && (g_dragCount >= 2 || (g_dragStartTile != 0 && g_dragEndTile == g_dragStartTile)))
         {
             g_pendingPreviewRelease = 1;
         }
@@ -2783,6 +3149,12 @@ static void PollDragFrameSamplerNoHook(void)
     isLeftDown = ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) ? 1 : 0;
 
     EnterCriticalSection(&g_pathLock);
+
+    // A cancellation belongs only to the release that created it; never carry it into a new click...
+    if (isLeftDown && !g_wasLeftDown && g_cancelMoveAbility)
+    {
+        ClearMoveCancellationNoLock();
+    }
 
     if (isLeftDown && g_wasLeftDown && g_dragAbility && g_dragCount > 0 && g_lastDragPreviewTargetTile != 0)
     {
@@ -2837,11 +3209,40 @@ static void __fastcall HookMoveAbilityOnTrigger(void* ability)
 {
     uint64_t startTile;
     uint64_t targetTile;
+    int32_t characterSize;
+    int hasStartAndTarget;
+    int allowManualPath;
+    int cancelTrigger;
+    int originReleasePending;
 
-    if (TryGetAbilityStartAndTarget(ability, &startTile, &targetTile))
+    startTile = 0;
+    targetTile = 0;
+    characterSize = 0;
+    hasStartAndTarget = TryGetAbilityStartAndTarget(ability, &startTile, &targetTile);
+    allowManualPath = IsAbilityCharacterSingleTile(ability, &characterSize);
+    cancelTrigger = 0;
+    originReleasePending = 0;
+
+    EnterCriticalSection(&g_pathLock);
+
+    if (g_manualDragArmed && g_dragAbility == ability && g_dragStartTile != 0)
     {
-        EnterCriticalSection(&g_pathLock);
+        ReturnDragToOriginIfCurrentlyHoveredNoLock(ability, hasStartAndTarget ? targetTile : g_lastDragPreviewTargetTile, "on-trigger");
+        originReleasePending = (g_dragEndTile == g_dragStartTile) ? 1 : 0;
+    }
 
+    if (ConsumeMoveCancellationNoLock(ability))
+    {
+        cancelTrigger = 1;
+    }
+    else if (originReleasePending)
+    {
+        ArmMoveCancellationNoLock(ability, "origin release reached OnTrigger before preview cleanup");
+        cancelTrigger = ConsumeMoveCancellationNoLock(ability);
+        ClearPreparedPathNoLock("origin release trigger cancelled");
+    }
+    else if (hasStartAndTarget && allowManualPath)
+    {
         if (g_manualDragArmed && g_dragCount >= 2 && g_dragAbility == ability)
         {
             PrepareDragPathNoLock();
@@ -2856,8 +3257,18 @@ static void __fastcall HookMoveAbilityOnTrigger(void* ability)
         {
             Log("Move trigger did not match prepared path: start=(%d,%d) target=(%d,%d) preparedCount=%d", TileX(startTile), TileY(startTile), TileX(targetTile), TileY(targetTile), g_preparedCount);
         }
+    }
+    else if (hasStartAndTarget)
+    {
+        Log("Move trigger left vanilla for non-1x1 character: sizeCode=%d ability=%p", characterSize, ability);
+    }
 
-        LeaveCriticalSection(&g_pathLock);
+    LeaveCriticalSection(&g_pathLock);
+
+    if (cancelTrigger)
+    {
+        Log("MoveAbility::OnTrigger suppressed because manual drag ended on its origin tile");
+        return;
     }
 
     if (g_origMoveAbilityOnTrigger)
@@ -2871,6 +3282,8 @@ static ManualPathBuffer* __fastcall HookMoveAbilityBuildPreviewPath(void* abilit
 {
     ManualPathBuffer* result;
     ManualPathBuffer* path;
+    int32_t characterSize;
+    int allowManualPath;
 
     SampleDragFromPathArgs(ability, startTile, targetTile);
 
@@ -2882,33 +3295,48 @@ static ManualPathBuffer* __fastcall HookMoveAbilityBuildPreviewPath(void* abilit
     }
 
     path = result ? result : outPath;
+    characterSize = 0;
+    allowManualPath = IsAbilityCharacterSingleTile(ability, &characterSize);
 
     EnterCriticalSection(&g_pathLock);
     RememberPreviewReachabilityNoLock(ability, startTile, targetTile, path);
-    PruneUnreachablePreviewTargetNoLock(ability, targetTile);
+
+    if (allowManualPath)
+    {
+        PruneUnreachablePreviewTargetNoLock(ability, targetTile);
+    }
 
     if (g_pendingPreviewRelease && g_dragAbility == ability)
     {
         g_pendingPreviewRelease = 0;
 
-        if (g_manualDragArmed)
+        if (g_manualDragArmed && allowManualPath)
         {
             PrepareDragPathNoLock();
+        }
+        else if (!allowManualPath)
+        {
+            Log("Pending manual release discarded for non-1x1 character: sizeCode=%d", characterSize);
+            ClearPreparedPathNoLock("non-1x1 pending release");
         }
 
         ClearDragPath();
         ClearFrameDragCandidatesNoLock();
     }
 
-    if (g_manualDragArmed && g_dragCount >= 2 && g_dragAbility == ability && g_lastPreviewWasReachable)
+    if (allowManualPath && g_manualDragArmed && g_dragAbility == ability && g_dragStartTile != 0 && g_dragEndTile == g_dragStartTile)
+    {
+        ClearPathBufferNoLock(path, "manual drag returned to origin");
+    }
+    else if (allowManualPath && g_manualDragArmed && g_dragCount >= 2 && g_dragAbility == ability && g_lastPreviewWasReachable)
     {
         OverwritePathBufferFromTiles(path, g_dragTiles, g_dragCount, "live preview pinned to manual drag");
     }
-    else if (g_manualDragArmed && g_dragCount >= 2 && g_dragAbility == ability && !g_lastPreviewWasReachable)
+    else if (allowManualPath && g_manualDragArmed && g_dragCount >= 2 && g_dragAbility == ability && !g_lastPreviewWasReachable)
     {
         Log("Live manual preview suppressed because current preview target is unreachable: target=(%d,%d) count=%d", TileX(targetTile), TileY(targetTile), g_dragCount);
     }
-    else if (HasPreparedPathNoLock(startTile, targetTile, MAX_MANUAL_STEPS))
+    else if (allowManualPath && HasPreparedPathNoLock(startTile, targetTile, MAX_MANUAL_STEPS))
     {
         OverwritePathBufferFromTiles(path, g_preparedTiles, g_preparedCount, "prepared preview");
     }
@@ -2923,6 +3351,7 @@ static ManualPathBuffer* __fastcall HookTacticsGridBuildMovePath(void* grid, Man
 {
     ManualPathBuffer* result;
     int shouldApply;
+    int32_t characterSize;
     LONG remainingBudget;
 
     result = NULL;
@@ -2930,6 +3359,18 @@ static ManualPathBuffer* __fastcall HookTacticsGridBuildMovePath(void* grid, Man
     if (g_origTacticsGridBuildMovePath)
     {
         result = g_origTacticsGridBuildMovePath(grid, outPath, character, startTile, targetTile, maxMove, flag);
+    }
+
+    characterSize = 0;
+
+    if (!IsCharacterSingleTile(character, &characterSize))
+    {
+        if (InterlockedCompareExchange(&g_applyNextPath, 0, 0) != 0)
+        {
+            Log("Execution manual path ignored for non-1x1 character: sizeCode=%d character=%p", characterSize, character);
+        }
+
+        return result ? result : outPath;
     }
 
     shouldApply = 0;
